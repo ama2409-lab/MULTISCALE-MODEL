@@ -1,0 +1,3 @@
+grid,D_eff,D_eff_norm,corr_length_vox,corr_length_m
+fine,1.172375e-07,1.172375e-02,1.000000e+00,1.000000e-05
+coarse,9.181143e-08,9.181143e-03,1.000000e+00,2.000000e-05

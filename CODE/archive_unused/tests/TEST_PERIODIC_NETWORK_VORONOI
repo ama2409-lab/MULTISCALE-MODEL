@@ -1,0 +1,342 @@
+# imports
+import numpy as np
+from scipy.spatial import Delaunay
+
+import numpy as np
+from scipy.spatial import Delaunay
+import openpnm as op
+
+# ---------- 0. user parameters ----------
+N = 3000                 # number of seeds
+L = 1.0                  # box length
+D_bulk = 1.0             # molecular diffusivity
+src_val = 1.0            # balanced source magnitude
+
+
+# ---------- 1. seed generation ----------
+rng = np.random.default_rng(0)
+seed_coords = rng.random((N, 3)) * L
+
+
+# ---------- 2. build periodic Voronoi network ----------
+#IMPORTANT FUNCTION TO BUILD PERIODIC VORONOI NETWORK !! - MAYBE REMOVE FOR SIMPLICITY
+def build_periodic_voronoi_graph(seed_coords, L):
+    # seed_coords: array Nx3 with values in [0,L)
+    N = seed_coords.shape[0]
+
+    # 1) construct tiled points and keep mapping to (orig_index, tile_shift)
+    tiles = [(i, j, k) for i in (-1,0,1) for j in (-1,0,1) for k in (-1,0,1)]
+    tiled_coords = []
+    tiled_map = []   # list of tuples (orig_idx, (sx,sy,sz))
+    for sx, sy, sz in tiles:
+        shift = np.array([sx, sy, sz], dtype=int) * L
+        for idx in range(N):
+            pt = seed_coords[idx] + shift
+            tiled_coords.append(pt)
+            tiled_map.append((idx, (sx, sy, sz)))
+    tiled_coords = np.asarray(tiled_coords)   # (27*N, 3)
+
+    # 2) compute Delaunay triangulation on tiled cloud
+    tri = Delaunay(tiled_coords)  # may raise if degenerate - jitter seeds slightly if so
+
+    # 3) extract edges from simplices
+    # each simplex is a tetrahedron (4 vertices in 3D); add all 6 edges
+    edges_set = set()
+    for simplex in tri.simplices:
+        verts = list(simplex)
+        for i in range(len(verts)):
+            for j in range(i+1, len(verts)):
+                a, b = verts[i], verts[j]
+                # canonical order
+                if a < b:
+                    edges_set.add((a, b))
+                else:
+                    edges_set.add((b, a))
+
+    # 4) map tiled indices back to original seed index and tile shift
+    # we only want throats where at least one endpoint is from central tile (0,0,0)
+    central_tile_index_set = set()
+    for t_idx, (orig, shift) in enumerate(tiled_map):
+        if shift == (0,0,0):
+            central_tile_index_set.add(t_idx)
+
+    pore_coords_center = seed_coords.copy()  # final pore coords, indexed 0..N-1
+
+    throat_pairs = []    # list of tuples (i_orig, j_orig, offset_vector)
+    seen_pairs = set()   # to avoid duplicates
+
+    for a_tidx, b_tidx in edges_set:
+        a_orig, a_shift = tiled_map[a_tidx]
+        b_orig, b_shift = tiled_map[b_tidx]
+
+        # Only keep edges that touch the central tile at least on one end
+        if (a_tidx in central_tile_index_set) or (b_tidx in central_tile_index_set):
+            # map to original indices and compute offset that maps b_orig into central frame relative to a_orig
+            # We want throat connecting pore a_orig (in center) to pore b_orig shifted by (b_shift - a_shift)
+            # But final network uses coordinates of central seeds (0,0,0). Therefore offset to apply to b is
+            # offset = (b_shift - a_shift), expressed in integers of L.
+            offset = np.subtract(b_shift, a_shift)  # tuple of ints in {-2,-1,0,1,2} theoretically; but because we tiled only +-1 it will be in {-1,0,1}
+            
+            # We must produce a canonical ordered pair (min_index, max_index) together with a consistent offset sign
+            i = int(a_orig)
+            j = int(b_orig)
+            # If both i and j are same original seed, skip (degenerate edge)
+            if i == j:
+                continue
+
+            # canonical key: (min,max, offset_for_that_order)
+            if i < j:
+                key = (i, j, tuple(offset))
+                # But offset corresponds to mapping b relative to a. If we reorder, we need inverse offset sign.
+            else:
+                # swap and invert offset
+                key = (j, i, tuple((-offset[0], -offset[1], -offset[2])))
+            
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            throat_pairs.append(key)
+
+    # throat_pairs now contains (i, j, offset) where i != j and at least one of the endpoints was central
+    # Convert to arrays
+    conns = []
+    offsets = []
+    for i, j, off in throat_pairs:
+        conns.append([int(i), int(j)])
+        offsets.append(np.array(off, dtype=int))
+    conns = np.asarray(conns, dtype=int)      # shape (M,2)
+    offsets = np.asarray(offsets, dtype=int)  # shape (M,3) integer multiples of L
+
+    # 5) compute throat lengths in central frame
+    lengths = np.zeros(len(conns), dtype=float)
+    for k, (i, j) in enumerate(conns):
+        off = offsets[k] * L                  # physical offset vector
+        pj_shifted = pore_coords_center[j] + off
+        vec = pj_shifted - pore_coords_center[i]
+        lengths[k] = np.linalg.norm(vec)
+
+    return pore_coords_center, conns, offsets, lengths
+
+coords, conns, offsets, lengths = build_periodic_voronoi_graph(seed_coords, L)
+
+# create generic network
+
+net = op.network.Network(coords=coords, conns=conns)
+net['pore.coords'] = coords
+net['throat.conns'] = conns
+
+# If you want to store offsets for later geometry calc, store as property on throats
+net['throat.offset'] = offsets  # integer offsets; user models can use this
+
+# Add geometry models: spheres_and_cylinders will compute throat.length for non-periodic throats.
+# For periodic throats we have precomputed lengths; either:
+#  - overwrite net['throat.length'] = precomputed_lengths
+#  - OR write a small model that uses offsets to compute lengths correctly before spheres_and_cylinders runs.
+net['throat.length'] = lengths
+
+# Optionally assign pore diameter / throat diameter (or let models assign them)
+# net['pore.diameter'] = ...
+# net['throat.diameter'] = ...
+
+# Add model collections and regenerate
+net.add_model_collection(op.models.collections.geometry.spheres_and_cylinders)
+net.regenerate_models()   # will compute derived geometry models, but throat.length already set
+
+#Checks & Verifications
+
+# validate geometry
+periodic_tids = net.throats('all')  # or net.Nt
+tl = np.asarray(net['throat.length'])
+td = np.asarray(net.get('throat.diameter', np.full(net.Nt, np.nan)))
+bad_len = np.where(~np.isfinite(tl) | (tl <= 0))[0]
+bad_diam = np.where(~np.isfinite(td) | (td <= 0))[0]
+print("Bad throat lengths:", bad_len.size, "Bad throat diameters:", bad_diam.size)
+if bad_len.size or bad_diam.size:
+    # fill fallback small positive values
+    if bad_len.size: tl[bad_len] = np.min(tl[np.isfinite(tl) & (tl>0)]) if np.any(np.isfinite(tl) & (tl>0)) else 1e-6*L
+    if bad_diam.size: td[bad_diam] = np.min(td[np.isfinite(td) & (td>0)]) if np.any(np.isfinite(td) & (td>0)) else 1e-4*L
+    net['throat.length'] = tl
+    net['throat.diameter'] = td
+
+
+#WORKS UNTIL FUCKING SINK TERMS
+# ---------- 3. add phase and physics ----------
+# proceed with phase, physics, balanced source diffusion as before
+air = op.phase.Air(network=net)
+air.add_model_collection(op.models.collections.physics.basic)
+air.regenerate_models()
+
+# ensure throat.diffusive_conductance exists and is finite
+if 'throat.diffusive_conductance' not in air.keys():
+    # compute simple tubular conductance g = D*A/L
+    Dp = np.full(net.Np, D_bulk)
+    try: Dp = np.asarray(air['pore.diffusivity'])
+    except: pass
+    pd = np.asarray(net.get('pore.diameter', np.full(net.Np, np.nan)))
+    td = np.asarray(net.get('throat.diameter', np.full(net.Nt, np.nan)))
+    tl = np.asarray(net['throat.length'])
+    conns = np.asarray(net['throat.conns'])
+    g = np.zeros(net.Nt, dtype=float)
+    small_d = 1e-9 * L
+    small_L = np.min(tl[np.isfinite(tl) & (tl>0)]) if np.any(np.isfinite(tl) & (tl>0)) else 1e-6*L
+    for ti in range(net.Nt):
+        Lval = float(tl[ti]) if np.isfinite(tl[ti]) and tl[ti] > 0 else small_L
+        if np.isfinite(td[ti]) and td[ti] > 0:
+            A = np.pi * (float(td[ti]) / 2.0) ** 2
+        else:
+            # fallback from pore diameters
+            a,b = int(conns[ti,0]), int(conns[ti,1])
+            d0 = float(pd[a]) if (a < pd.size and np.isfinite(pd[a]) and pd[a]>0) else small_d
+            d1 = float(pd[b]) if (b < pd.size and np.isfinite(pd[b]) and pd[b]>0) else small_d
+            A = np.pi * (min(d0,d1)/2.0)**2
+        Davg = np.nanmean(Dp[conns[ti]]) if Dp.size==net.Np else np.nanmean(Dp)
+        g[ti] = Davg * A / Lval
+    g[~np.isfinite(g)] = 0.0
+    g[g < 1e-25] = 0.0
+    air['throat.diffusive_conductance'] = g
+else:
+    g = np.asarray(air['throat.diffusive_conductance'])
+    g[~np.isfinite(g)] = 0.0
+    air['throat.diffusive_conductance'] = g
+
+# balanced source: +Q in half domain, -Q in other half
+coords = np.asarray(net['pore.coords'])
+axis = 0
+mid = (coords[:,axis].min() + coords[:,axis].max())/2.0
+src_mask = coords[:,axis] < mid
+sink_mask = ~src_mask
+air['pore.source_term'] = np.zeros(net.Np, dtype=float)
+air['pore.source_term'][src_mask]  =  float(src_val) / float(src_mask.sum())
+air['pore.source_term'][sink_mask] = -float(src_val) / float(sink_mask.sum())
+
+# ---------- 4. Fickian diffusion ----------
+fd = op.algorithms.FickianDiffusion(network=net, phase=air)
+# register source
+nonzero = np.where(air['pore.source_term'] != 0.0)[0]
+fd.set_source(propname='pore.source_term', pores=nonzero)
+
+# ---------- SAFE pinning for sink/source approach ----------
+# Force exact zero-sum and re-run the current fd workflow
+src = np.zeros(net.Np, dtype=float)
+src[src_mask]  = float(src_val) / float(src_mask.sum())
+src[sink_mask] = -float(src_val) / float(sink_mask.sum())
+
+# Enforce exact zero mean (removes the 1.3e-3 residual)
+src = src - np.mean(src)
+
+air['pore.source_term'] = src.copy()
+# recreate algorithm to ensure fresh internals
+fd = op.algorithms.FickianDiffusion(network=net, phase=air)
+
+# choose a pin guaranteed zero-source (make sure pin index has zero)
+pin = 0
+if not np.isclose(air['pore.source_term'][pin], 0.0):
+    # move pin's amount to last pore deterministically
+    other = net.Np - 1 if net.Np - 1 != pin else (net.Np - 2 if net.Np>2 else 0)
+    delta = float(air['pore.source_term'][pin])
+    src[pin] = 0.0
+    src[other] -= delta
+    air['pore.source_term'] = src.copy()
+
+fd.set_value_BC(pores=[pin], values=0.0)
+nonzero = np.where(~np.isclose(air['pore.source_term'], 0.0))[0]
+if nonzero.size:
+    fd.set_source(propname='pore.source_term', pores=nonzero)
+fd.run()
+
+# ------------------------ Diagnostics ------------------------
+print("sum(source_term):", float(air['pore.source_term'].sum()))
+print("C mean/std:", float(fd['pore.concentration'].mean()), float(fd['pore.concentration'].std()))
+print("C_src, C_sink:", float(fd['pore.concentration'][src_mask].mean()), float(fd['pore.concentration'][sink_mask].mean()))
+
+
+# 1) exact sums and counts
+print("sum(src array)            =", float(np.sum(src)))
+print("sum(air['pore.source_term'])=", float(np.sum(air['pore.source_term'])))
+print("nonzero source count      =", int(np.count_nonzero(~np.isclose(air['pore.source_term'], 0.0))))
+print("src_mask count, sink_mask count =", int(src_mask.sum()), int(sink_mask.sum()))
+
+# 2) conductance diagnostics
+g = np.asarray(air['throat.diffusive_conductance'])
+print("num throats total:", net.Nt, "num positive g:", int(np.count_nonzero(g>0)))
+print("g min/max (finite):", np.nanmin(g[np.isfinite(g)]), np.nanmax(g[np.isfinite(g)]))
+
+# 3) cluster connectivity (is there a conductive cluster connecting src and sink sets?)
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+conns = np.asarray(net['throat.conns'])[g>0]
+if conns.size:
+    rows = np.concatenate([conns[:,0], conns[:,1]])
+    cols = np.concatenate([conns[:,1], conns[:,0]])
+    data = np.ones(rows.size, dtype=int)
+    G = csr_matrix((data, (rows, cols)), shape=(net.Np, net.Np))
+    ncomp, labels = connected_components(G, directed=False, connection='weak')
+    # cluster labels for source/sink pores
+    src_labels = labels[np.where(src_mask)[0]]
+    sink_labels = labels[np.where(sink_mask)[0]]
+    print("connected components:", ncomp)
+    print("unique src cluster labels (sample up to 10):", np.unique(src_labels)[:10])
+    print("unique sink cluster labels (sample up to 10):", np.unique(sink_labels)[:10])
+    # are there clusters containing both src and sink?
+    overlap = set(np.unique(src_labels)).intersection(set(np.unique(sink_labels)))
+    print("clusters containing both src & sink (overlap count):", len(overlap))
+else:
+    print("No positive conductances found (all g<=0).")
+
+
+
+# ---------- 5. compute D_eff ----------
+C = fd['pore.concentration']
+C_src = C[src_mask].mean()
+C_sink = C[sink_mask].mean()
+deltaC = C_src - C_sink
+Lbox = coords[:,axis].max() - coords[:,axis].min()
+other = [i for i in (0,1,2) if i!=axis]
+A = (np.ptp(coords[:, 0])) * (np.ptp(coords[:, 1]))
+
+
+Q_applied = float(src_val)
+D_eff = abs(Q_applied) * Lbox / (A * abs(deltaC)) if deltaC != 0 else np.nan
+print("C_src, C_sink, deltaC:", C_src, C_sink, deltaC)
+print("D_eff:", D_eff)
+print("sum source term:", air['pore.source_term'].sum())
+
+#--------------------
+
+
+
+# ----------- 6. Plotting with ghost images --------------
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+coords = np.asarray(net['pore.coords'])
+conns = np.asarray(net['throat.conns'])
+pc = fd['pore.concentration'] if 'pore.concentration' in fd.keys() else np.zeros(net.Np)
+
+fig = plt.figure(figsize=(9,9))
+ax = fig.add_subplot(projection='3d')
+
+# draw throats
+for a,b in conns:
+    pa = coords[int(a)]; pb = coords[int(b)]
+    ax.plot([pa[0], pb[0]],[pa[1], pb[1]],[pa[2], pb[2]], color='lightgrey', linewidth=0.4)
+
+# draw pores colored by concentration
+sc = ax.scatter(coords[:,0], coords[:,1], coords[:,2], c=pc, cmap='viridis', s=12)
+
+# draw ghost image in +x to visualize periodicity (optional)
+Lvec = np.array([L, L, L])
+coords_ghost = coords + np.array([L,0,0])
+ax.scatter(coords_ghost[:,0], coords_ghost[:,1], coords_ghost[:,2], color='lightgrey', s=4, alpha=0.25)
+
+fig.colorbar(sc, ax=ax, shrink=0.6, label='Concentration')
+ax.set_box_aspect([
+    np.ptp(coords[:, 0]),
+    np.ptp(coords[:, 1]),
+    np.ptp(coords[:, 2]),
+])
+ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+plt.tight_layout()
+plt.show()
+# you can save with fig.savefig('periodic_voronoi_conc.png', dpi=300)
+

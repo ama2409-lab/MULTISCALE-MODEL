@@ -1,0 +1,11 @@
+REV Diagnostics Report
+CSV: C:\Users\ARTHUR AMALIR\OneDrive\Documents\1.ColumbiaClasses\MULTI SCALE COMP\PROJECT\CODE\FINAL SET\const_density_1e12\sweep_const_density_1e12_20251123_203902.csv
+STATS CSV: C:\Users\ARTHUR AMALIR\OneDrive\Documents\1.ColumbiaClasses\MULTI SCALE COMP\PROJECT\CODE\FINAL SET\const_density_1e12\rev_stats_20251123_153922.csv
+
+Per-L summary:
+L=1e-05: d_mean=5.402040235672096e-10, d_std=4.4950720328036196e-10, d_n=2, d_cov=0.8321063592086266
+L=2e-05: d_mean=3.9210087954262766e-10, d_std=2.485861554958436e-10, d_n=2, d_cov=0.633985202445378
+
+Bootstrap CIs (95%):
+L=1e-05: dir_CI=(np.float64(9.069682028684768e-11), np.float64(9.897112268475717e-10)) (n=2), neu_CI=(np.float64(8.162807161362936e-11), np.float64(8.685791444519642e-10)) (n=2)
+L=2e-05: dir_CI=(np.float64(1.4351472404678409e-10), np.float64(6.406870350384713e-10)) (n=2), neu_CI=(np.float64(1.2986495286551125e-10), np.float64(5.596209479323422e-10)) (n=2)
