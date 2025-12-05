@@ -1,0 +1,26 @@
+__pycache__/ 
+*.py[cod]
+*.pyo
+
+# VS Code
+.vscode/
+
+# Data and results
+CODE/FINAL SET/const_density_1e12/
+CODE/FINAL SET/const_density_1e13/
+CODE/FINAL SET/const_density_1e14/
+CODE/FINAL SET/DATASETS_const_density_1e12*/
+CODE/FINAL SET/organized_*/
+CODE/FINAL SET/results_*/
+CODE/FINAL SET/plots/
+DATASETS/
+
+# Logs / benchmarks
+CODE/run_log.txt
+CODE/benchmark_results.csv
+CODE/proof_of_life_results.csv
+CODE/voxel_scaling_test.csv
+
+# OS cruft
+.DS_Store
+Thumbs.db
